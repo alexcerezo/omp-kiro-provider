@@ -1,0 +1,21 @@
+name: Publish to npm
+on:
+  release:
+    types: [published]
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Check tag matches package version
+        run: |
+          V=$(node -p "require(\"./package.json\").version")
+          [ "v$V" = "${{ github.event.release.tag_name }}" ] || { echo "tag does not match package.json version $V"; exit 1; }
+      - run: npm publish --access public --provenance
