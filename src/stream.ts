@@ -57,6 +57,9 @@ function parseHeaders(buf: Uint8Array, length: number): Record<string, string> {
 async function* parseEventStream(body: ReadableStream<Uint8Array>): AsyncGenerator<EventFrame, void, undefined> {
 	const reader = body.getReader();
 	let buffer = new Uint8Array(0);
+	// Set only when read() returns EOF. A throw (abort) or a consumer `return`
+	// must cancel, or the body rejection is left unhandled.
+	let completed = false;
 
 	function append(chunk: Uint8Array): void {
 		const next = new Uint8Array(buffer.length + chunk.length);
@@ -78,7 +81,10 @@ async function* parseEventStream(body: ReadableStream<Uint8Array>): AsyncGenerat
 		while (true) {
 			while (buffer.length < 12) {
 				const { done, value } = await reader.read();
-				if (done) return;
+				if (done) {
+					completed = true;
+					return;
+				}
 				append(value);
 			}
 
@@ -87,7 +93,10 @@ async function* parseEventStream(body: ReadableStream<Uint8Array>): AsyncGenerat
 
 			while (buffer.length < totalLength) {
 				const { done, value } = await reader.read();
-				if (done) return;
+				if (done) {
+					completed = true;
+					return;
+				}
 				append(value);
 			}
 
@@ -106,7 +115,16 @@ async function* parseEventStream(body: ReadableStream<Uint8Array>): AsyncGenerat
 			yield { eventType, messageType, payload };
 		}
 	} finally {
-		reader.releaseLock();
+		// Same contract as omp's `decodeEventStream`: cancel on the way out so the
+		// fetch-body abort rejection is observed. `releaseLock()` alone leaves it
+		// unhandled, and omp treats that as a fatal unhandled rejection when a
+		// steer or a compaction aborts the request.
+		if (!completed) await reader.cancel().catch(() => {});
+		try {
+			reader.releaseLock();
+		} catch {
+			// cancel() may already have detached the reader
+		}
 	}
 }
 
@@ -201,6 +219,49 @@ function clonePartial(msg: AssistantMessage): AssistantMessage {
 	return { ...msg, content: msg.content.slice() };
 }
 
+/** Sentinel omp uses for a bare `AbortController.abort()` (no caller reason). */
+const ABORT_ERROR_MESSAGE = "Request was aborted";
+
+function isAbortError(err: unknown): boolean {
+	return err instanceof Error && err.name === "AbortError";
+}
+
+/**
+ * Text omp shows for a caller cancel. A string or non-abort `Error` passed to
+ * `abort(reason)` is preserved; a bare abort stays the sentinel downstream
+ * treats as "no specific reason".
+ */
+function abortErrorMessage(signal: AbortSignal | undefined): string {
+	const reason = signal?.reason;
+	if (typeof reason === "string" && reason.trim().length > 0) return reason;
+	if (reason instanceof Error && reason.name !== "AbortError" && reason.message.trim().length > 0) {
+		return reason.message;
+	}
+	return ABORT_ERROR_MESSAGE;
+}
+
+/** Terminal event for a caller cancel. Resolves `result()`; does not reject it. */
+function pushAborted(
+	stream: AssistantMessageEventStream,
+	partial: AssistantMessage,
+	signal: AbortSignal | undefined,
+): void {
+	if (stream.done) return;
+	partial.stopReason = "aborted";
+	partial.errorMessage = abortErrorMessage(signal);
+	stream.push({ type: "error", reason: "aborted", error: clonePartial(partial) });
+	stream.end();
+}
+
+function pushStreamError(stream: AssistantMessageEventStream, partial: AssistantMessage, err: unknown): void {
+	if (stream.done) return;
+	const msg = err instanceof Error ? err.message : String(err);
+	partial.stopReason = "error";
+	partial.errorMessage = `Kiro: ${msg}`;
+	stream.push({ type: "error", reason: "error", error: clonePartial(partial) });
+	stream.end();
+}
+
 // ---------------------------------------------------------------------------
 // Credential resolver type
 // ---------------------------------------------------------------------------
@@ -234,399 +295,468 @@ export function streamKiro(
 	const stream = createAssistantMessageEventStream();
 
 	void (async () => {
-		let accessToken: string;
-		let apiRegion: string;
-		let profileArn: string | undefined;
-		let authMethod: string | undefined;
-
-		try {
-			({ accessToken, apiRegion, profileArn, authMethod } = await resolveCredentials());
-		} catch (err) {
-			const msg = err instanceof Error ? err.message : String(err);
-			const errPartial = makePartial(model);
-			errPartial.content = [{ type: "text", text: `Kiro: credential error: ${msg}` }];
-			errPartial.errorMessage = `Kiro: credential error: ${msg}`;
-			errPartial.stopReason = "error";
-			stream.push({ type: "error", reason: "error", error: errPartial });
-			return;
-		}
-
-		// Desktop (kiro-native) tokens use the Kiro runtime; every other token
-		// (IdC, Builder ID) uses the Amazon Q endpoint with a Q-resolved profileArn.
-		const isDesktop = authMethod === "desktop";
-		const endpoint = isDesktop ? endpointForApiRegion(apiRegion) : qEndpointForApiRegion(apiRegion);
-		if (!isDesktop) {
-			profileArn = await resolveQProfileArn(accessToken, apiRegion);
-		}
-
-		let requestBody: KiroGenerateRequest;
-		try {
-			requestBody = buildKiroRequest(model, context, options, profileArn);
-		} catch (err) {
-			const msg = err instanceof Error ? err.message : String(err);
-			const errPartial = makePartial(model);
-			errPartial.content = [{ type: "text", text: `Kiro: request build error: ${msg}` }];
-			errPartial.errorMessage = `Kiro: request build error: ${msg}`;
-			errPartial.stopReason = "error";
-			stream.push({ type: "error", reason: "error", error: errPartial });
-			return;
-		}
-
-		const modelId = requestBody.conversationState.currentMessage.userInputMessage.modelId;
-		logger.debug("kiro-provider: request", { endpoint, modelId, authMethod, hasProfileArn: !!profileArn });
-
-		let res: Response;
-		const sdkVersion = "1.28.3";
-		const ua = `aws-sdk-rust/1.0.0 ua/2.1 os/other lang/rust api/codewhispererstreaming#${sdkVersion} m/E app/AmazonQ-For-CLI md/appVersion-${sdkVersion}-${crypto.randomUUID().replace(/-/g, "")}`;
-		try {
-			res = await fetch(endpoint, {
-				method: "POST",
-				headers: {
-					"Content-Type": "application/x-amz-json-1.0",
-					Accept: "application/json",
-					Authorization: `Bearer ${accessToken}`,
-					"X-Amz-Target": "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
-					"x-amzn-codewhisperer-optout": "true",
-					"x-amzn-kiro-agent-mode": "vibe",
-					"amz-sdk-invocation-id": crypto.randomUUID(),
-					"amz-sdk-request": "attempt=1; max=1",
-					"x-amz-user-agent": ua,
-					"user-agent": ua,
-				},
-				body: JSON.stringify(requestBody),
-				signal: options?.signal,
-			});
-		} catch (err) {
-			const msg = err instanceof Error ? err.message : String(err);
-			logger.error("kiro-provider: network error", { endpoint, err: msg });
-			const errPartial = makePartial(model);
-			errPartial.content = [{ type: "text", text: `Kiro: network error: ${msg}` }];
-			errPartial.errorMessage = `Kiro: network error: ${msg}`;
-			errPartial.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			stream.push({ type: "error", reason: errPartial.stopReason, error: errPartial });
-			return;
-		}
-
-		if (!res.ok) {
-			const text = await res.text().catch(() => "");
-			logger.error("kiro-provider: API error", { endpoint, status: res.status, body: text.slice(0, 300) });
-			let message = `Kiro API error (${res.status}): ${text}`;
-			if (res.status === 403) {
-				forgetQProfileArn(accessToken, apiRegion);
-				message = `Kiro API error (403): access token rejected — run /login kiro. ${text}`;
-			}
-			const errPartial = makePartial(model);
-			errPartial.content = [{ type: "text", text: message }];
-			errPartial.errorMessage = message;
-			errPartial.stopReason = "error";
-			stream.push({ type: "error", reason: "error", error: errPartial });
-			return;
-		}
-
-		if (!res.body) {
-			const errPartial = makePartial(model);
-			errPartial.content = [{ type: "text", text: "Kiro: empty response body" }];
-			errPartial.errorMessage = "Kiro: empty response body";
-			errPartial.stopReason = "error";
-			stream.push({ type: "error", reason: "error", error: errPartial });
-			return;
-		}
-
+		const signal = options?.signal;
+		// One partial for the whole request so an abort mid-summary keeps tokens
+		// already streamed. Compaction awaits `result()` and checks the signal.
 		const partial = makePartial(model);
-
-		stream.push({ type: "start", partial: clonePartial(partial) });
-
-		let textIndex: number | undefined;
-		let thinkingIndex: number | undefined;
-		let pendingToolCall: { id: string; name: string; inputStr: string; index: number } | undefined;
-		let emittedToolCalls = 0;
-		let usage: Usage | undefined;
-
-		// Kiro streams one tool call as several toolUseEvent frames:
-		// `{name, toolUseId, input?}`, then `{input: "<chunk>"}`…, then `{stop: true}`.
-		const finalizeToolCall = (): void => {
-			if (!pendingToolCall) return;
-			const tc = partial.content[pendingToolCall.index] as ToolCall;
-			const raw = pendingToolCall.inputStr.trim();
-			try {
-				tc.arguments = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
-			} catch {
-				logger.warn("kiro-provider: failed to parse tool input", { tool: pendingToolCall.name });
-				tc.arguments = {};
-			}
-			stream.push({
-				type: "toolcall_end",
-				contentIndex: pendingToolCall.index,
-				toolCall: tc,
-				partial: clonePartial(partial),
-			});
-			emittedToolCalls++;
-			pendingToolCall = undefined;
+		let responseBody: ReadableStream<Uint8Array> | null = null;
+		const onAbort = (): void => {
+			// Observe the body rejection even when it is not the promise `read()`
+			// is awaiting (abort before the reader is locked, or a second Bun
+			// rejection beside it). A locked stream's cancel rejects; swallow it.
+			if (!responseBody) return;
+			void responseBody.cancel().catch(() => {});
 		};
+		signal?.addEventListener("abort", onAbort);
 
-		for await (const frame of parseEventStream(res.body)) {
-			const { eventType, messageType, payload } = frame;
-
-			if (messageType === "exception" || messageType === "error") {
-				const raw = new TextDecoder().decode(payload);
-				let detail = raw;
-				try {
-					const parsed = JSON.parse(raw) as { message?: unknown };
-					if (typeof parsed.message === "string") detail = parsed.message;
-				} catch {
-					// keep raw payload text
-				}
-				const message = `Kiro stream error (${eventType || messageType}): ${detail}`;
-				logger.error("kiro-provider: stream exception", { eventType, detail: detail.slice(0, 300) });
-				partial.stopReason = "error";
-				partial.errorMessage = message;
-				stream.push({ type: "error", reason: "error", error: clonePartial(partial) });
+		try {
+			if (signal?.aborted) {
+				pushAborted(stream, partial, signal);
 				return;
 			}
 
-			if (payload.length === 0 && eventType !== "assistantResponseStartedEvent") {
-				continue;
+			let accessToken: string;
+			let apiRegion: string;
+			let profileArn: string | undefined;
+			let authMethod: string | undefined;
+
+			try {
+				({ accessToken, apiRegion, profileArn, authMethod } = await resolveCredentials());
+			} catch (err) {
+				if (signal?.aborted || isAbortError(err)) {
+					pushAborted(stream, partial, signal);
+					return;
+				}
+				const msg = err instanceof Error ? err.message : String(err);
+				partial.content = [{ type: "text", text: `Kiro: credential error: ${msg}` }];
+				partial.errorMessage = `Kiro: credential error: ${msg}`;
+				partial.stopReason = "error";
+				stream.push({ type: "error", reason: "error", error: clonePartial(partial) });
+				stream.end();
+				return;
 			}
 
-			let data: Record<string, unknown> = {};
-			if (payload.length > 0) {
+			// Desktop (kiro-native) tokens use the Kiro runtime; every other token
+			// (IdC, Builder ID) uses the Amazon Q endpoint with a Q-resolved profileArn.
+			const isDesktop = authMethod === "desktop";
+			const endpoint = isDesktop ? endpointForApiRegion(apiRegion) : qEndpointForApiRegion(apiRegion);
+			if (!isDesktop) {
+				profileArn = await resolveQProfileArn(accessToken, apiRegion, fetch, signal);
+			}
+			if (signal?.aborted) {
+				pushAborted(stream, partial, signal);
+				return;
+			}
+
+			let requestBody: KiroGenerateRequest;
+			try {
+				requestBody = buildKiroRequest(model, context, options, profileArn);
+			} catch (err) {
+				if (signal?.aborted || isAbortError(err)) {
+					pushAborted(stream, partial, signal);
+					return;
+				}
+				const msg = err instanceof Error ? err.message : String(err);
+				partial.content = [{ type: "text", text: `Kiro: request build error: ${msg}` }];
+				partial.errorMessage = `Kiro: request build error: ${msg}`;
+				partial.stopReason = "error";
+				stream.push({ type: "error", reason: "error", error: clonePartial(partial) });
+				stream.end();
+				return;
+			}
+
+			const modelId = requestBody.conversationState.currentMessage.userInputMessage.modelId;
+			logger.debug("kiro-provider: request", { endpoint, modelId, authMethod, hasProfileArn: !!profileArn });
+
+			let res: Response;
+			const sdkVersion = "1.28.3";
+			const ua = `aws-sdk-rust/1.0.0 ua/2.1 os/other lang/rust api/codewhispererstreaming#${sdkVersion} m/E app/AmazonQ-For-CLI md/appVersion-${sdkVersion}-${crypto.randomUUID().replace(/-/g, "")}`;
+			try {
+				res = await fetch(endpoint, {
+					method: "POST",
+					headers: {
+						"Content-Type": "application/x-amz-json-1.0",
+						Accept: "application/json",
+						Authorization: `Bearer ${accessToken}`,
+						"X-Amz-Target": "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+						"x-amzn-codewhisperer-optout": "true",
+						"x-amzn-kiro-agent-mode": "vibe",
+						"amz-sdk-invocation-id": crypto.randomUUID(),
+						"amz-sdk-request": "attempt=1; max=1",
+						"x-amz-user-agent": ua,
+						"user-agent": ua,
+					},
+					body: JSON.stringify(requestBody),
+					signal: options?.signal,
+				});
+			} catch (err) {
+				if (signal?.aborted || isAbortError(err)) {
+					pushAborted(stream, partial, signal);
+					return;
+				}
+				const msg = err instanceof Error ? err.message : String(err);
+				logger.error("kiro-provider: network error", { endpoint, err: msg });
+				partial.content = [{ type: "text", text: `Kiro: network error: ${msg}` }];
+				partial.errorMessage = `Kiro: network error: ${msg}`;
+				partial.stopReason = "error";
+				stream.push({ type: "error", reason: "error", error: clonePartial(partial) });
+				stream.end();
+				return;
+			}
+
+			responseBody = res.body;
+			if (signal?.aborted) {
+				pushAborted(stream, partial, signal);
+				return;
+			}
+
+			if (!res.ok) {
+				const text = await res.text().catch(() => "");
+				if (signal?.aborted) {
+					pushAborted(stream, partial, signal);
+					return;
+				}
+				logger.error("kiro-provider: API error", { endpoint, status: res.status, body: text.slice(0, 300) });
+				let message = `Kiro API error (${res.status}): ${text}`;
+				if (res.status === 403) {
+					forgetQProfileArn(accessToken, apiRegion);
+					message = `Kiro API error (403): access token rejected — run /login kiro. ${text}`;
+				}
+				partial.content = [{ type: "text", text: message }];
+				partial.errorMessage = message;
+				partial.stopReason = "error";
+				stream.push({ type: "error", reason: "error", error: clonePartial(partial) });
+				stream.end();
+				return;
+			}
+
+			if (!res.body) {
+				partial.content = [{ type: "text", text: "Kiro: empty response body" }];
+				partial.errorMessage = "Kiro: empty response body";
+				partial.stopReason = "error";
+				stream.push({ type: "error", reason: "error", error: clonePartial(partial) });
+				stream.end();
+				return;
+			}
+
+			stream.push({ type: "start", partial: clonePartial(partial) });
+
+			let textIndex: number | undefined;
+			let thinkingIndex: number | undefined;
+			let pendingToolCall: { id: string; name: string; inputStr: string; index: number } | undefined;
+			let emittedToolCalls = 0;
+			let usage: Usage | undefined;
+
+			// Kiro streams one tool call as several toolUseEvent frames:
+			// `{name, toolUseId, input?}`, then `{input: "<chunk>"}`…, then `{stop: true}`.
+			const finalizeToolCall = (): void => {
+				if (!pendingToolCall) return;
+				const tc = partial.content[pendingToolCall.index] as ToolCall;
+				const raw = pendingToolCall.inputStr.trim();
 				try {
-					data = JSON.parse(new TextDecoder().decode(payload)) as Record<string, unknown>;
-				} catch (err) {
-					logger.warn("kiro-provider: failed to parse event payload", { eventType, err });
-					continue;
+					tc.arguments = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+				} catch {
+					logger.warn("kiro-provider: failed to parse tool input", { tool: pendingToolCall.name });
+					tc.arguments = {};
 				}
-			}
+				stream.push({
+					type: "toolcall_end",
+					contentIndex: pendingToolCall.index,
+					toolCall: tc,
+					partial: clonePartial(partial),
+				});
+				emittedToolCalls++;
+				pendingToolCall = undefined;
+			};
 
-			switch (eventType) {
-				case "assistantResponseStartedEvent": {
-					break;
-				}
+			for await (const frame of parseEventStream(res.body)) {
+				const { eventType, messageType, payload } = frame;
 
-				case "assistantResponseEvent": {
-					const raw = String(data["content"] ?? "");
-					const segments = splitThinkingTags(raw);
-
-					for (const seg of segments) {
-						if (seg.kind === "thinking") {
-							if (thinkingIndex === undefined) {
-								thinkingIndex = partial.content.length;
-								const block: ThinkingContent = { type: "thinking", thinking: "" };
-								partial.content.push(block);
-								stream.push({
-									type: "thinking_start",
-									contentIndex: thinkingIndex,
-									partial: clonePartial(partial),
-								});
-							}
-							const thinkingBlock = partial.content[thinkingIndex] as ThinkingContent;
-							thinkingBlock.thinking += seg.content;
-							stream.push({
-								type: "thinking_delta",
-								contentIndex: thinkingIndex,
-								delta: seg.content,
-								partial: clonePartial(partial),
-							});
-						} else {
-							if (!seg.content) continue;
-
-							if (textIndex === undefined) {
-								textIndex = partial.content.length;
-								const block: TextContent = { type: "text", text: "" };
-								partial.content.push(block);
-								stream.push({
-									type: "text_start",
-									contentIndex: textIndex,
-									partial: clonePartial(partial),
-								});
-							}
-							const textBlock = partial.content[textIndex] as TextContent;
-							textBlock.text += seg.content;
-							stream.push({
-								type: "text_delta",
-								contentIndex: textIndex,
-								delta: seg.content,
-								partial: clonePartial(partial),
-							});
-						}
+				if (messageType === "exception" || messageType === "error") {
+					const raw = new TextDecoder().decode(payload);
+					let detail = raw;
+					try {
+						const parsed = JSON.parse(raw) as { message?: unknown };
+						if (typeof parsed.message === "string") detail = parsed.message;
+					} catch {
+						// keep raw payload text
 					}
-					break;
-				}
-
-				case "thinkingEvent": {
-					const thinkingDelta = String(data["content"] ?? "");
-					if (!thinkingDelta) break;
-
-					if (thinkingIndex === undefined) {
-						thinkingIndex = partial.content.length;
-						const block: ThinkingContent = { type: "thinking", thinking: "" };
-						partial.content.push(block);
-						stream.push({
-							type: "thinking_start",
-							contentIndex: thinkingIndex,
-							partial: clonePartial(partial),
-						});
-					}
-					const thinkingBlock = partial.content[thinkingIndex] as ThinkingContent;
-					thinkingBlock.thinking += thinkingDelta;
-					stream.push({
-						type: "thinking_delta",
-						contentIndex: thinkingIndex,
-						delta: thinkingDelta,
-						partial: clonePartial(partial),
-					});
-					break;
-				}
-
-				case "toolUseEvent": {
-					if (textIndex !== undefined) {
-						const textBlock = partial.content[textIndex] as TextContent;
-						stream.push({
-							type: "text_end",
-							contentIndex: textIndex,
-							content: textBlock.text,
-							partial: clonePartial(partial),
-						});
-						textIndex = undefined;
-					}
-					if (thinkingIndex !== undefined) {
-						const thinkingBlock = partial.content[thinkingIndex] as ThinkingContent;
-						stream.push({
-							type: "thinking_end",
-							contentIndex: thinkingIndex,
-							content: thinkingBlock.thinking,
-							partial: clonePartial(partial),
-						});
-						thinkingIndex = undefined;
-					}
-
-					const toolUseId = typeof data["toolUseId"] === "string" ? data["toolUseId"] : undefined;
-					const toolName = typeof data["name"] === "string" ? data["name"] : undefined;
-					const rawInput = data["input"];
-					const inputChunk =
-						typeof rawInput === "string" ? rawInput : rawInput === undefined ? "" : JSON.stringify(rawInput);
-
-					// A frame for a different tool call closes the pending one.
-					if (pendingToolCall && toolUseId && toolUseId !== pendingToolCall.id) {
-						finalizeToolCall();
-					}
-
-					if (!pendingToolCall && toolUseId && toolName) {
-						const tcIndex = partial.content.length;
-						const toolCall: ToolCall = { type: "toolCall", id: toolUseId, name: toolName, arguments: {} };
-						partial.content.push(toolCall);
-						pendingToolCall = { id: toolUseId, name: toolName, inputStr: "", index: tcIndex };
-						stream.push({ type: "toolcall_start", contentIndex: tcIndex, partial: clonePartial(partial) });
-					}
-
-					if (pendingToolCall && inputChunk) {
-						pendingToolCall.inputStr += inputChunk;
-						stream.push({
-							type: "toolcall_delta",
-							contentIndex: pendingToolCall.index,
-							delta: inputChunk,
-							partial: clonePartial(partial),
-						});
-					}
-
-					if (data["stop"] === true) finalizeToolCall();
-					break;
-				}
-
-				case "toolUseEndEvent": {
-					finalizeToolCall();
-					break;
-				}
-
-				case "contextUsageEvent": {
-					const usageData = (data["data"] ?? data) as Record<string, unknown>;
-					const inputTokens = Number(usageData["inputTokens"] ?? 0);
-					const outputTokens = Number(usageData["outputTokens"] ?? 0);
-					usage = {
-						input: inputTokens,
-						output: outputTokens,
-						cacheRead: 0,
-						cacheWrite: 0,
-						totalTokens: inputTokens + outputTokens,
-						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-					};
-					break;
-				}
-
-				case "messageEndEvent": {
-					finalizeToolCall();
-					const rawStop = String(data["stopReason"] ?? "end_turn");
-					const mapped = mapStopReason(rawStop);
-					const stopReason = emittedToolCalls > 0 && mapped === "stop" ? "toolUse" : mapped;
-
-					if (textIndex !== undefined) {
-						const textBlock = partial.content[textIndex] as TextContent;
-						stream.push({
-							type: "text_end",
-							contentIndex: textIndex,
-							content: textBlock.text,
-							partial: clonePartial(partial),
-						});
-						textIndex = undefined;
-					}
-
-					if (thinkingIndex !== undefined) {
-						const thinkingBlock = partial.content[thinkingIndex] as ThinkingContent;
-						stream.push({
-							type: "thinking_end",
-							contentIndex: thinkingIndex,
-							content: thinkingBlock.thinking,
-							partial: clonePartial(partial),
-						});
-						thinkingIndex = undefined;
-					}
-
-					partial.stopReason = stopReason;
-					if (usage) partial.usage = usage;
-
-					stream.push({
-						type: "done",
-						reason: stopReason,
-						message: clonePartial(partial),
-					});
+					const message = `Kiro stream error (${eventType || messageType}): ${detail}`;
+					logger.error("kiro-provider: stream exception", { eventType, detail: detail.slice(0, 300) });
+					partial.stopReason = "error";
+					partial.errorMessage = message;
+					stream.push({ type: "error", reason: "error", error: clonePartial(partial) });
 					return;
 				}
 
-				case "codeReferenceEvent": {
-					break;
+				if (payload.length === 0 && eventType !== "assistantResponseStartedEvent") {
+					continue;
 				}
 
-				default: {
-					logger.debug(`kiro-provider: unknown event type: ${eventType}`);
-					break;
+				let data: Record<string, unknown> = {};
+				if (payload.length > 0) {
+					try {
+						data = JSON.parse(new TextDecoder().decode(payload)) as Record<string, unknown>;
+					} catch (err) {
+						logger.warn("kiro-provider: failed to parse event payload", { eventType, err });
+						continue;
+					}
+				}
+
+				switch (eventType) {
+					case "assistantResponseStartedEvent": {
+						break;
+					}
+
+					case "assistantResponseEvent": {
+						const raw = String(data["content"] ?? "");
+						const segments = splitThinkingTags(raw);
+
+						for (const seg of segments) {
+							if (seg.kind === "thinking") {
+								if (thinkingIndex === undefined) {
+									thinkingIndex = partial.content.length;
+									const block: ThinkingContent = { type: "thinking", thinking: "" };
+									partial.content.push(block);
+									stream.push({
+										type: "thinking_start",
+										contentIndex: thinkingIndex,
+										partial: clonePartial(partial),
+									});
+								}
+								const thinkingBlock = partial.content[thinkingIndex] as ThinkingContent;
+								thinkingBlock.thinking += seg.content;
+								stream.push({
+									type: "thinking_delta",
+									contentIndex: thinkingIndex,
+									delta: seg.content,
+									partial: clonePartial(partial),
+								});
+							} else {
+								if (!seg.content) continue;
+
+								if (textIndex === undefined) {
+									textIndex = partial.content.length;
+									const block: TextContent = { type: "text", text: "" };
+									partial.content.push(block);
+									stream.push({
+										type: "text_start",
+										contentIndex: textIndex,
+										partial: clonePartial(partial),
+									});
+								}
+								const textBlock = partial.content[textIndex] as TextContent;
+								textBlock.text += seg.content;
+								stream.push({
+									type: "text_delta",
+									contentIndex: textIndex,
+									delta: seg.content,
+									partial: clonePartial(partial),
+								});
+							}
+						}
+						break;
+					}
+
+					case "thinkingEvent": {
+						const thinkingDelta = String(data["content"] ?? "");
+						if (!thinkingDelta) break;
+
+						if (thinkingIndex === undefined) {
+							thinkingIndex = partial.content.length;
+							const block: ThinkingContent = { type: "thinking", thinking: "" };
+							partial.content.push(block);
+							stream.push({
+								type: "thinking_start",
+								contentIndex: thinkingIndex,
+								partial: clonePartial(partial),
+							});
+						}
+						const thinkingBlock = partial.content[thinkingIndex] as ThinkingContent;
+						thinkingBlock.thinking += thinkingDelta;
+						stream.push({
+							type: "thinking_delta",
+							contentIndex: thinkingIndex,
+							delta: thinkingDelta,
+							partial: clonePartial(partial),
+						});
+						break;
+					}
+
+					case "toolUseEvent": {
+						if (textIndex !== undefined) {
+							const textBlock = partial.content[textIndex] as TextContent;
+							stream.push({
+								type: "text_end",
+								contentIndex: textIndex,
+								content: textBlock.text,
+								partial: clonePartial(partial),
+							});
+							textIndex = undefined;
+						}
+						if (thinkingIndex !== undefined) {
+							const thinkingBlock = partial.content[thinkingIndex] as ThinkingContent;
+							stream.push({
+								type: "thinking_end",
+								contentIndex: thinkingIndex,
+								content: thinkingBlock.thinking,
+								partial: clonePartial(partial),
+							});
+							thinkingIndex = undefined;
+						}
+
+						const toolUseId = typeof data["toolUseId"] === "string" ? data["toolUseId"] : undefined;
+						const toolName = typeof data["name"] === "string" ? data["name"] : undefined;
+						const rawInput = data["input"];
+						const inputChunk =
+							typeof rawInput === "string" ? rawInput : rawInput === undefined ? "" : JSON.stringify(rawInput);
+
+						// A frame for a different tool call closes the pending one.
+						if (pendingToolCall && toolUseId && toolUseId !== pendingToolCall.id) {
+							finalizeToolCall();
+						}
+
+						if (!pendingToolCall && toolUseId && toolName) {
+							const tcIndex = partial.content.length;
+							const toolCall: ToolCall = { type: "toolCall", id: toolUseId, name: toolName, arguments: {} };
+							partial.content.push(toolCall);
+							pendingToolCall = { id: toolUseId, name: toolName, inputStr: "", index: tcIndex };
+							stream.push({ type: "toolcall_start", contentIndex: tcIndex, partial: clonePartial(partial) });
+						}
+
+						if (pendingToolCall && inputChunk) {
+							pendingToolCall.inputStr += inputChunk;
+							stream.push({
+								type: "toolcall_delta",
+								contentIndex: pendingToolCall.index,
+								delta: inputChunk,
+								partial: clonePartial(partial),
+							});
+						}
+
+						if (data["stop"] === true) finalizeToolCall();
+						break;
+					}
+
+					case "toolUseEndEvent": {
+						finalizeToolCall();
+						break;
+					}
+
+					case "contextUsageEvent": {
+						const usageData = (data["data"] ?? data) as Record<string, unknown>;
+						const inputTokens = Number(usageData["inputTokens"] ?? 0);
+						const outputTokens = Number(usageData["outputTokens"] ?? 0);
+						usage = {
+							input: inputTokens,
+							output: outputTokens,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: inputTokens + outputTokens,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						};
+						break;
+					}
+
+					case "messageEndEvent": {
+						finalizeToolCall();
+						const rawStop = String(data["stopReason"] ?? "end_turn");
+						const mapped = mapStopReason(rawStop);
+						const stopReason = emittedToolCalls > 0 && mapped === "stop" ? "toolUse" : mapped;
+
+						if (textIndex !== undefined) {
+							const textBlock = partial.content[textIndex] as TextContent;
+							stream.push({
+								type: "text_end",
+								contentIndex: textIndex,
+								content: textBlock.text,
+								partial: clonePartial(partial),
+							});
+							textIndex = undefined;
+						}
+
+						if (thinkingIndex !== undefined) {
+							const thinkingBlock = partial.content[thinkingIndex] as ThinkingContent;
+							stream.push({
+								type: "thinking_end",
+								contentIndex: thinkingIndex,
+								content: thinkingBlock.thinking,
+								partial: clonePartial(partial),
+							});
+							thinkingIndex = undefined;
+						}
+
+						partial.stopReason = stopReason;
+						if (usage) partial.usage = usage;
+
+						stream.push({
+							type: "done",
+							reason: stopReason,
+							message: clonePartial(partial),
+						});
+						stream.end();
+						return;
+					}
+
+					case "codeReferenceEvent": {
+						break;
+					}
+
+					default: {
+						logger.debug(`kiro-provider: unknown event type: ${eventType}`);
+						break;
+					}
 				}
 			}
-		}
 
-		// Stream ended without messageEndEvent
-		finalizeToolCall();
-		if (textIndex !== undefined) {
-			const textBlock = partial.content[textIndex] as TextContent;
-			stream.push({
-				type: "text_end",
-				contentIndex: textIndex,
-				content: textBlock.text,
-				partial: clonePartial(partial),
-			});
+			// A caller abort can surface as a clean EOF instead of a rejected read
+			// (steer, Esc, or compaction cancelling a summary). That must not commit
+			// a successful stop — `completeSimple` would then treat the summary as done.
+			if (signal?.aborted) {
+				pushAborted(stream, partial, signal);
+				return;
+			}
+
+			// Stream ended without messageEndEvent
+			finalizeToolCall();
+			if (textIndex !== undefined) {
+				const textBlock = partial.content[textIndex] as TextContent;
+				stream.push({
+					type: "text_end",
+					contentIndex: textIndex,
+					content: textBlock.text,
+					partial: clonePartial(partial),
+				});
+			}
+			if (thinkingIndex !== undefined) {
+				const thinkingBlock = partial.content[thinkingIndex] as ThinkingContent;
+				stream.push({
+					type: "thinking_end",
+					contentIndex: thinkingIndex,
+					content: thinkingBlock.thinking,
+					partial: clonePartial(partial),
+				});
+			}
+			const finalReason = emittedToolCalls > 0 ? "toolUse" : "stop";
+			partial.stopReason = finalReason;
+			if (usage) partial.usage = usage;
+			stream.push({ type: "done", reason: finalReason, message: clonePartial(partial) });
+			stream.end();
+		} catch (err) {
+			// The task is floating (`void`). Any rejection here is the crash omp
+			// reports as `[Unhandled Rejection] AbortError` on steer and on
+			// compaction, whose stacks only show the abort caller.
+			if (!stream.done) {
+				try {
+					if (signal?.aborted || isAbortError(err)) pushAborted(stream, partial, signal);
+					else pushStreamError(stream, partial, err);
+				} catch (pushErr) {
+					logger.error("kiro-provider: failed to settle stream", { err: pushErr });
+				}
+			}
+		} finally {
+			signal?.removeEventListener("abort", onAbort);
 		}
-		if (thinkingIndex !== undefined) {
-			const thinkingBlock = partial.content[thinkingIndex] as ThinkingContent;
-			stream.push({
-				type: "thinking_end",
-				contentIndex: thinkingIndex,
-				content: thinkingBlock.thinking,
-				partial: clonePartial(partial),
-			});
-		}
-		const finalReason = emittedToolCalls > 0 ? "toolUse" : "stop";
-		partial.stopReason = finalReason;
-		if (usage) partial.usage = usage;
-		stream.push({ type: "done", reason: finalReason, message: clonePartial(partial) });
 	})();
 
 	return stream;
