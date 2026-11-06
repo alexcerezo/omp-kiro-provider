@@ -25,6 +25,7 @@ export async function resolveQProfileArn(
 	accessToken: string,
 	apiRegion: string,
 	fetchImpl: FetchImpl = fetch,
+	signal?: AbortSignal,
 ): Promise<string | undefined> {
 	const cacheKey = qProfileCacheKey(apiRegion, accessToken);
 	const cached = qProfileArnCache.get(cacheKey);
@@ -40,6 +41,7 @@ export async function resolveQProfileArn(
 				"X-Amz-Target": "AmazonCodeWhispererService.ListAvailableProfiles",
 			},
 			body: "{}",
+			signal,
 		});
 		if (!res.ok) {
 			logger.warn("kiro-provider: Q ListAvailableProfiles failed", { status: res.status });
@@ -50,6 +52,9 @@ export async function resolveQProfileArn(
 		if (arn) qProfileArnCache.set(cacheKey, arn);
 		return arn;
 	} catch (err) {
+		// Caller cancellation is not a profile failure. Swallowing it here lets the
+		// stream settle as aborted instead of hanging on ListAvailableProfiles.
+		if (signal?.aborted || (err instanceof Error && err.name === "AbortError")) return undefined;
 		logger.warn("kiro-provider: Q profile resolution failed", { err });
 		return undefined;
 	}
