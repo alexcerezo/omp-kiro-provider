@@ -256,6 +256,8 @@ async function fetchModelsFromEndpoint(
 export async function fetchKiroModelCatalog(
 	apiKey: string | undefined,
 	storedCredentials?: OAuthCredentials,
+	preferredRegion?: string,
+	authMethod?: "idc" | "desktop",
 ): Promise<SanitizedKiroModelCatalog> {
 	// When both apiKey and storedCredentials are absent, try IDE then kiro-cli
 	let effectiveApiKey = apiKey;
@@ -282,9 +284,14 @@ export async function fetchKiroModelCatalog(
 		}
 	}
 
+	const resolvedRegion = preferredRegion
+		? apiRegionForFallback(preferredRegion)
+		: (fallbackRegion ? apiRegionForFallback(fallbackRegion) : undefined);
+
 	const credential = resolveKiroManagementCredential(
 		effectiveApiKey,
-		fallbackRegion ? apiRegionForFallback(fallbackRegion) : undefined,
+		resolvedRegion,
+		authMethod,
 	);
 	const route = await resolveKiroManagementRoute(credential, effectiveStored);
 	logger.debug("kiro-provider: resolved route", { apiRegion: route.apiRegion, hasProfileArn: !!route.profileArn });

@@ -11,6 +11,7 @@
  */
 
 import type { OAuthCredentials } from "@oh-my-pi/pi-ai";
+import { unpackKiroCredentials, type KiroCredentials } from "./oauth";
 
 export type KiroAuthMethod = "idc" | "desktop";
 
@@ -22,16 +23,20 @@ export interface DecodedKiroApiKey {
 }
 
 /** Auth method from the packed refresh suffix (`…|desktop` vs `…|idc` / `…|builder-id`). */
-export function authMethodFromRefresh(refresh: string): KiroAuthMethod {
+export function authMethodFromRefresh(refresh: string | undefined): KiroAuthMethod {
+	if (!refresh) return "idc";
 	return refresh.endsWith("|desktop") ? "desktop" : "idc";
 }
 
 /** Encode a stored credential into the envelope passed to `streamSimple`. */
 export function encodeKiroApiKey(creds: OAuthCredentials): string {
+	const kiro = unpackKiroCredentials(creds);
+	const authMethod = (creds as Partial<KiroCredentials>).authMethod ?? kiro.authMethod;
+	const region = creds.region ?? kiro.region ?? kiro.apiRegion;
 	return JSON.stringify({
 		token: creds.access,
-		region: creds.region,
-		authMethod: authMethodFromRefresh(creds.refresh),
+		region,
+		authMethod,
 	});
 }
 

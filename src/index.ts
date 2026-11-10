@@ -69,8 +69,9 @@ const factory: ExtensionFactory = pi => {
 			// Errors must propagate: the host treats a returned list (even `[]`) as a
 			// successful, authoritative catalog, which hides the provider with no
 			// diagnostic. A throw keeps the cached catalog and records "unavailable".
-			const token = apiKey ? decodeKiroApiKey(apiKey).token : undefined;
-			const catalog = await fetchKiroModelCatalog(token);
+			const decoded = apiKey ? decodeKiroApiKey(apiKey) : undefined;
+			const token = decoded?.token;
+			const catalog = await fetchKiroModelCatalog(token, undefined, decoded?.region, decoded?.authMethod);
 			const models = mapKiroModelCatalog(catalog);
 			// Cache apiRegion + profileArn as a fallback for raw tokens without routing info.
 			if (token) {

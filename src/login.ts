@@ -325,15 +325,18 @@ async function tryKiroIdeLogin(): Promise<KiroCredentials | undefined> {
 		return undefined;
 	}
 	const apiRegion = apiRegionForAwsRegion(cred.region);
+	const authMethod = cred.authMethod === "desktop" ? "desktop" : "idc";
+
 	// Accept both desktop-issued (kiro-native) and enterprise IdC (AWS OIDC) tokens.
-	// Enterprise IdC tokens carry clientId/clientSecret for refresh; profileArn is
-	// resolved later by the management API route resolution.
-	if (cred.clientId && cred.clientSecret) {
+	if (authMethod === "idc") {
 		// Enterprise IdC token
 		return {
 			access: cred.accessToken,
 			expires: cred.expiresAt,
-			refresh: `${cred.refreshToken}|${cred.clientId}|${cred.clientSecret}|idc`,
+			refresh:
+				cred.clientId && cred.clientSecret
+					? `${cred.refreshToken}|${cred.clientId}|${cred.clientSecret}|idc`
+					: `${cred.refreshToken}|||idc`,
 			// `region` is the SSO/OIDC region (needed for refresh); the API region is derived from it.
 			region: cred.region,
 			authMethod: "idc",
@@ -349,7 +352,7 @@ async function tryKiroIdeLogin(): Promise<KiroCredentials | undefined> {
 		access: cred.accessToken,
 		expires: cred.expiresAt,
 		refresh: `${cred.refreshToken}|desktop`,
-		region: apiRegion,
+		region: cred.region,
 		authMethod: "desktop",
 		clientId: undefined,
 		clientSecret: undefined,
@@ -359,7 +362,7 @@ async function tryKiroIdeLogin(): Promise<KiroCredentials | undefined> {
 }
 
 /**
- * Attempt login using kiro-cli DB credentials (desktop-issued).
+ * Attempt login using kiro-cli DB credentials (desktop-issued or IdC).
  * Returns `undefined` if not available or expired.
  */
 async function tryKiroCliLogin(): Promise<KiroCredentials | undefined> {
@@ -367,18 +370,27 @@ async function tryKiroCliLogin(): Promise<KiroCredentials | undefined> {
 	if (!cred) return undefined;
 	if (cred.expiresAt <= Date.now() + 60_000) return undefined;
 
-	// Only use if desktop-issued (not enterprise IdC via AWS OIDC)
+	const apiRegion = apiRegionForAwsRegion(cred.region);
+
 	if (cred.authMethod === "idc") {
-		logger.debug("kiro-provider: kiro-cli credential is IdC — skipping");
-		return undefined;
+		return {
+			access: cred.accessToken,
+			expires: cred.expiresAt,
+			refresh: `${cred.refreshToken}|||idc`,
+			region: cred.region,
+			authMethod: "idc",
+			clientId: undefined,
+			clientSecret: undefined,
+			profileArn: cred.profileArn,
+			apiRegion,
+		};
 	}
 
-	const apiRegion = apiRegionForAwsRegion(cred.region);
 	return {
 		access: cred.accessToken,
 		expires: cred.expiresAt,
 		refresh: `${cred.refreshToken}|desktop`,
-		region: apiRegion,
+		region: cred.region,
 		authMethod: "desktop",
 		clientId: undefined,
 		clientSecret: undefined,

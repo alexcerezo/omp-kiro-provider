@@ -60,30 +60,43 @@ function refreshSuffix(packed: string, fallback: string): string {
  * API region for desktop tokens; `apiRegion` is always derived from it.
  */
 export function unpackKiroCredentials(creds: OAuthCredentials): KiroCredentials {
-	const parts = creds.refresh.split("|");
+	const parts = creds.refresh ? creds.refresh.split("|") : [];
 	const refreshToken = parts[0] ?? "";
-	const apiRegion = creds.region ? apiRegionForAwsRegion(creds.region) : undefined;
-	const isIdc = parts.length >= 4 && parts[parts.length - 1] !== "desktop";
+	const explicitAuthMethod = (creds as Partial<KiroCredentials>).authMethod;
+	const suffix = parts.length > 1 ? parts[parts.length - 1] : undefined;
+	const isIdc =
+		explicitAuthMethod === "idc" ||
+		suffix === "idc" ||
+		suffix === "builder-id" ||
+		(parts.length >= 4 && suffix !== "desktop") ||
+		Boolean((creds as Partial<KiroCredentials>).clientId && (creds as Partial<KiroCredentials>).clientSecret) ||
+		(explicitAuthMethod !== "desktop" && suffix !== "desktop");
+
+	const region = creds.region ?? (creds as Partial<KiroCredentials>).apiRegion;
+	const apiRegion = region ? apiRegionForAwsRegion(region) : ((creds as Partial<KiroCredentials>).apiRegion ?? undefined);
+	const profileArn = (creds as Partial<KiroCredentials>).profileArn;
 
 	if (isIdc) {
 		return {
 			...creds,
-			refresh: creds.refresh,
+			region,
+			refresh: creds.refresh || refreshToken,
 			authMethod: "idc",
-			clientId: parts[1] || undefined,
-			clientSecret: parts[2] || undefined,
-			profileArn: undefined,
+			clientId: parts.length >= 4 ? (parts[1] || undefined) : (creds as Partial<KiroCredentials>).clientId,
+			clientSecret: parts.length >= 4 ? (parts[2] || undefined) : (creds as Partial<KiroCredentials>).clientSecret,
+			profileArn,
 			apiRegion,
 		};
 	}
 
 	return {
 		...creds,
+		region,
 		refresh: refreshToken,
 		authMethod: "desktop",
 		clientId: undefined,
 		clientSecret: undefined,
-		profileArn: undefined,
+		profileArn,
 		apiRegion,
 	};
 }
@@ -136,10 +149,9 @@ async function refreshIdcToken(
 
 async function refreshDesktopToken(
 	refreshToken: string,
-	region: string,
 	profileArn: string | undefined,
 ): Promise<{ accessToken: string; refreshToken: string; expiresAt: number; profileArn?: string }> {
-	const url = `https://prod.${region}.auth.desktop.kiro.dev/refreshToken`;
+	const url = "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken";
 	const body: Record<string, string> = { refreshToken };
 	if (profileArn) body["profileArn"] = profileArn;
 
@@ -209,28 +221,16 @@ export async function refreshKiroToken(credentials: OAuthCredentials): Promise<O
 		throw lastError;
 	}
 
-	// Desktop auth: `region` already is a Kiro API region.
-	const region = kiro.apiRegion ?? "us-east-1";
-	let lastError: unknown;
-	const regions = [region, ...KIRO_API_REGIONS.filter(r => r !== region)];
-
-	for (const r of regions) {
-		try {
-			const result = await refreshDesktopToken(rawRefresh, r, kiro.profileArn);
-			return {
-				...credentials,
-				access: result.accessToken,
-				expires: result.expiresAt,
-				refresh: `${result.refreshToken}|desktop`,
-				region: r,
-			};
-		} catch (err) {
-			lastError = err;
-			logger.warn("kiro-provider: desktop refresh failed", { region: r, status: refreshErrorStatus(err) });
-		}
-	}
-
-	throw lastError;
+	// Desktop auth: auth server is global (us-east-1); preserve stored region
+	// (e.g. eu-central-1) so regional inference routing is not overwritten.
+	const result = await refreshDesktopToken(rawRefresh, kiro.profileArn);
+	return {
+		...credentials,
+		access: result.accessToken,
+		expires: result.expiresAt,
+		refresh: `${result.refreshToken}|desktop`,
+		region: credentials.region ?? kiro.region ?? kiro.apiRegion ?? "us-east-1",
+	};
 }
 
 /** HTTP status embedded in a refresh error message, without logging the response body. */
@@ -273,17 +273,5 @@ export async function refreshRawKiroCredential(cred: {
 	}
 
 	// Desktop auth
-	const apiRegion = apiRegionForAwsRegion(region);
-	const regions = [apiRegion, ...KIRO_API_REGIONS.filter(r => r !== apiRegion)];
-	let lastError: unknown;
-	for (const r of regions) {
-		try {
-			const result = await refreshDesktopToken(cred.refreshToken, r, cred.profileArn);
-			return result.accessToken;
-		} catch (err) {
-			lastError = err;
-			logger.warn("kiro-provider: desktop refresh failed", { region: r, status: refreshErrorStatus(err) });
-		}
-	}
-	throw lastError;
+	return (await refreshDesktopToken(cred.refreshToken, cred.profileArn)).accessToken;
 }
