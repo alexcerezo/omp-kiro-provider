@@ -191,6 +191,46 @@ function mapStopReason(raw: string): "stop" | "length" | "toolUse" {
 	}
 }
 
+// Kiro does not report token counts: `contextUsageEvent` carries only the
+// context-window percentage after the turn. Derive tokens from it, falling back
+// to a ~4 chars/token estimate when the event is missing.
+const CHARS_PER_TOKEN = 4;
+
+function estimateUsage(
+	partial: AssistantMessage,
+	model: Model<Api>,
+	requestBody: KiroGenerateRequest,
+	contextPercentage: number | undefined,
+	explicitInput: number | undefined,
+	explicitOutput: number | undefined,
+): Usage {
+	let outChars = 0;
+	for (const block of partial.content) {
+		if (block.type === "text") outChars += block.text.length;
+		else if (block.type === "thinking") outChars += block.thinking.length;
+		else if (block.type === "toolCall") outChars += block.name.length + JSON.stringify(block.arguments ?? {}).length;
+	}
+	const output = explicitOutput ?? Math.ceil(outChars / CHARS_PER_TOKEN);
+	let input = explicitInput;
+	if (input === undefined) {
+		if (contextPercentage !== undefined && model.contextWindow > 0) {
+			// The percentage covers the prompt plus the generated reply.
+			const contextTokens = Math.round((contextPercentage / 100) * model.contextWindow);
+			input = Math.max(0, contextTokens - output);
+		} else {
+			input = Math.ceil(JSON.stringify(requestBody.conversationState).length / CHARS_PER_TOKEN);
+		}
+	}
+	return {
+		input,
+		output,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: input + output,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+}
+
 // ---------------------------------------------------------------------------
 // Partial AssistantMessage factory
 // ---------------------------------------------------------------------------
@@ -445,7 +485,12 @@ export function streamKiro(
 			let thinkingIndex: number | undefined;
 			let pendingToolCall: { id: string; name: string; inputStr: string; index: number } | undefined;
 			let emittedToolCalls = 0;
-			let usage: Usage | undefined;
+			let contextPercentage: number | undefined;
+			let explicitInput: number | undefined;
+			let explicitOutput: number | undefined;
+			const applyUsage = (): void => {
+				partial.usage = estimateUsage(partial, model, requestBody, contextPercentage, explicitInput, explicitOutput);
+			};
 
 			// Kiro streams one tool call as several toolUseEvent frames:
 			// `{name, toolUseId, input?}`, then `{input: "<chunk>"}`…, then `{stop: true}`.
@@ -645,16 +690,12 @@ export function streamKiro(
 
 					case "contextUsageEvent": {
 						const usageData = (data["data"] ?? data) as Record<string, unknown>;
-						const inputTokens = Number(usageData["inputTokens"] ?? 0);
-						const outputTokens = Number(usageData["outputTokens"] ?? 0);
-						usage = {
-							input: inputTokens,
-							output: outputTokens,
-							cacheRead: 0,
-							cacheWrite: 0,
-							totalTokens: inputTokens + outputTokens,
-							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-						};
+						const pct = Number(usageData["contextUsagePercentage"]);
+						if (Number.isFinite(pct)) contextPercentage = pct;
+						const explicitIn = Number(usageData["inputTokens"]);
+						const explicitOut = Number(usageData["outputTokens"]);
+						if (Number.isFinite(explicitIn)) explicitInput = explicitIn;
+						if (Number.isFinite(explicitOut)) explicitOutput = explicitOut;
 						break;
 					}
 
@@ -687,7 +728,7 @@ export function streamKiro(
 						}
 
 						partial.stopReason = stopReason;
-						if (usage) partial.usage = usage;
+						applyUsage();
 
 						stream.push({
 							type: "done",
@@ -739,7 +780,7 @@ export function streamKiro(
 			}
 			const finalReason = emittedToolCalls > 0 ? "toolUse" : "stop";
 			partial.stopReason = finalReason;
-			if (usage) partial.usage = usage;
+			applyUsage();
 			stream.push({ type: "done", reason: finalReason, message: clonePartial(partial) });
 			stream.end();
 		} catch (err) {
