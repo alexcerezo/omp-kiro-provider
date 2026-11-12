@@ -10,6 +10,7 @@
  */
 
 import type { ProviderModelConfig } from "@oh-my-pi/pi-coding-agent";
+import { lookupApiRates } from "./pricing";
 import type { SanitizedKiroModelCatalog, SanitizedKiroModel } from "./management";
 
 const ANTHROPIC_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
@@ -76,7 +77,7 @@ function mapModel(model: SanitizedKiroModel): ProviderModelConfig {
 		reasoning,
 		thinking,
 		input: mapInputTypes(model.supportedInputTypes),
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		cost: lookupApiRates(model.modelId) ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		premiumMultiplier,
 		contextWindow: model.maxInputTokens,
 		maxTokens: model.maxOutputTokens,

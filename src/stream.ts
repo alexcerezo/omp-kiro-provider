@@ -18,6 +18,7 @@ import { createAssistantMessageEventStream } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AssistantMessageEventStream } from "@oh-my-pi/pi-ai";
 import { endpointForApiRegion, qEndpointForApiRegion } from "./models";
+import { lookupApiRates } from "./pricing";
 import { forgetQProfileArn, resolveQProfileArn } from "./q-profile";
 import { buildKiroRequest, type KiroGenerateRequest } from "./transform";
 
@@ -196,7 +197,7 @@ function mapStopReason(raw: string): "stop" | "length" | "toolUse" {
 // to a ~4 chars/token estimate when the event is missing.
 const CHARS_PER_TOKEN = 4;
 
-function estimateUsage(
+export function estimateUsage(
 	partial: AssistantMessage,
 	model: Model<Api>,
 	requestBody: KiroGenerateRequest,
@@ -221,13 +222,16 @@ function estimateUsage(
 			input = Math.ceil(JSON.stringify(requestBody.conversationState).length / CHARS_PER_TOKEN);
 		}
 	}
+	const rates = lookupApiRates(model.id) ?? model.cost;
+	const costInput = (input * rates.input) / 1_000_000;
+	const costOutput = (output * rates.output) / 1_000_000;
 	return {
 		input,
 		output,
 		cacheRead: 0,
 		cacheWrite: 0,
 		totalTokens: input + output,
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		cost: { input: costInput, output: costOutput, cacheRead: 0, cacheWrite: 0, total: costInput + costOutput },
 	};
 }
 
