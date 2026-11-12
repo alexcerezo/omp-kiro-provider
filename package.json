@@ -1,6 +1,6 @@
 {
   "name": "omp-kiro-provider",
-  "version": "2.0.3",
+  "version": "2.0.4",
   "description": "Kiro AI provider plugin for omp — OAuth login, dynamic model discovery, and streaming inference",
   "main": "./src/index.ts",
   "types": "./src/index.ts",
@@ -17,6 +17,7 @@
   },
   "peerDependencies": {
     "@oh-my-pi/pi-ai": ">=18.12.2",
+    "@oh-my-pi/pi-catalog": ">=18.12.2",
     "@oh-my-pi/pi-coding-agent": ">=18.12.2",
     "@oh-my-pi/pi-utils": ">=18.12.2"
   },
