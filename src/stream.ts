@@ -18,6 +18,7 @@ import { createAssistantMessageEventStream } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AssistantMessageEventStream } from "@oh-my-pi/pi-ai";
 import { endpointForApiRegion, qEndpointForApiRegion } from "./models";
+import { resolveKiroClientVersion } from "./client-version";
 import { lookupApiRates } from "./pricing";
 import { forgetQProfileArn, resolveQProfileArn } from "./q-profile";
 import { buildKiroRequest, type KiroGenerateRequest } from "./transform";
@@ -413,9 +414,7 @@ export function streamKiro(
 			logger.debug("kiro-provider: request", { endpoint, modelId, authMethod, hasProfileArn: !!profileArn });
 
 			let res: Response;
-			// Kiro rejects clients older than its minimum supported CLI version (HTTP 400);
-			// KIRO_CLI_VERSION lets users track a new release without waiting for a plugin update.
-			const sdkVersion = process.env["KIRO_CLI_VERSION"]?.trim() || "3.3.0";
+			const sdkVersion = await resolveKiroClientVersion();
 			const ua = `aws-sdk-rust/1.0.0 ua/2.1 os/other lang/rust api/codewhispererstreaming#${sdkVersion} m/E app/AmazonQ-For-CLI md/appVersion-${sdkVersion}-${crypto.randomUUID().replace(/-/g, "")}`;
 			try {
 				res = await fetch(endpoint, {
