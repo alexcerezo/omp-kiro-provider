@@ -18,7 +18,7 @@ import { createAssistantMessageEventStream } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AssistantMessageEventStream } from "@oh-my-pi/pi-ai";
 import { endpointForApiRegion, qEndpointForApiRegion } from "./models";
-import { resolveKiroClientVersion } from "./client-version";
+import { kiroIdeUserAgent, resolveKiroClientVersion } from "./client-version";
 import { lookupApiRates } from "./pricing";
 import { forgetQProfileArn, resolveQProfileArn } from "./q-profile";
 import { buildKiroRequest, type KiroGenerateRequest } from "./transform";
@@ -414,8 +414,7 @@ export function streamKiro(
 			logger.debug("kiro-provider: request", { endpoint, modelId, authMethod, hasProfileArn: !!profileArn });
 
 			let res: Response;
-			const sdkVersion = await resolveKiroClientVersion();
-			const ua = `aws-sdk-rust/1.0.0 ua/2.1 os/other lang/rust api/codewhispererstreaming#${sdkVersion} m/E app/AmazonQ-For-CLI md/appVersion-${sdkVersion}-${crypto.randomUUID().replace(/-/g, "")}`;
+			const { userAgent, amzUserAgent } = kiroIdeUserAgent(await resolveKiroClientVersion());
 			try {
 				res = await fetch(endpoint, {
 					method: "POST",
@@ -428,8 +427,8 @@ export function streamKiro(
 						"x-amzn-kiro-agent-mode": "vibe",
 						"amz-sdk-invocation-id": crypto.randomUUID(),
 						"amz-sdk-request": "attempt=1; max=1",
-						"x-amz-user-agent": ua,
-						"user-agent": ua,
+						"x-amz-user-agent": amzUserAgent,
+						"user-agent": userAgent,
 					},
 					body: JSON.stringify(requestBody),
 					signal: options?.signal,
