@@ -15,6 +15,13 @@ import type {
 	Usage,
 } from "@oh-my-pi/pi-ai";
 import { createAssistantMessageEventStream } from "@oh-my-pi/pi-ai";
+import { StreamTimeoutError } from "@oh-my-pi/pi-ai/error";
+import {
+	armPreResponseTimeout,
+	getStreamFirstEventTimeoutMs,
+	getStreamIdleTimeoutMs,
+	iterateWithIdleTimeout,
+} from "@oh-my-pi/pi-ai/utils/idle-iterator";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AssistantMessageEventStream } from "@oh-my-pi/pi-ai";
 import { endpointForApiRegion, qEndpointForApiRegion } from "./models";
@@ -226,6 +233,11 @@ export function estimateUsage(
 	const rates = lookupApiRates(model.id) ?? model.cost;
 	const costInput = (input * rates.input) / 1_000_000;
 	const costOutput = (output * rates.output) / 1_000_000;
+	// Kiro's rate multiplier is the premium-request weight `omp stats` sums.
+	// A 1× model leaves the field unset so it is not counted as premium.
+	const premium = model.premiumMultiplier;
+	const premiumRequests =
+		typeof premium === "number" && Number.isFinite(premium) && premium > 0 ? premium : undefined;
 	return {
 		input,
 		output,
@@ -233,6 +245,7 @@ export function estimateUsage(
 		cacheWrite: 0,
 		totalTokens: input + output,
 		cost: { input: costInput, output: costOutput, cacheRead: 0, cacheWrite: 0, total: costInput + costOutput },
+		...(premiumRequests !== undefined ? { premiumRequests } : {}),
 	};
 }
 
@@ -271,6 +284,42 @@ function isAbortError(err: unknown): boolean {
 	return err instanceof Error && err.name === "AbortError";
 }
 
+/** Same wording the built-in providers use, so a stalled `/compact` or agent turn is recognizable. */
+const FIRST_EVENT_TIMEOUT_ERROR = "Kiro stream timed out while waiting for the first event";
+const IDLE_TIMEOUT_ERROR = "Kiro stream stalled while waiting for the next event";
+
+function pushWatchdog(
+	stream: AssistantMessageEventStream,
+	partial: AssistantMessage,
+	message: string,
+	seal?: (message: AssistantMessage) => void,
+): void {
+	if (stream.done) return;
+	partial.stopReason = "error";
+	partial.errorMessage = message;
+	seal?.(partial);
+	stream.push({ type: "error", reason: "error", error: clonePartial(partial) });
+	stream.end();
+}
+
+/**
+ * Caller option wins, including `0` (disabled). Otherwise the same env vars and
+ * defaults as omp's built-in stream wrapper.
+ */
+function resolveStreamWatchdogs(options: SimpleStreamOptions): {
+	idleTimeoutMs: number | undefined;
+	firstEventTimeoutMs: number | undefined;
+} {
+	const idleTimeoutMs =
+		options.streamIdleTimeoutMs !== undefined ? options.streamIdleTimeoutMs : getStreamIdleTimeoutMs();
+	const idleFloor = typeof idleTimeoutMs === "number" && idleTimeoutMs > 0 ? idleTimeoutMs : undefined;
+	const firstEventTimeoutMs =
+		options.streamFirstEventTimeoutMs !== undefined
+			? options.streamFirstEventTimeoutMs
+			: getStreamFirstEventTimeoutMs(idleFloor);
+	return { idleTimeoutMs, firstEventTimeoutMs };
+}
+
 /**
  * Text omp shows for a caller cancel. A string or non-abort `Error` passed to
  * `abort(reason)` is preserved; a bare abort stays the sentinel downstream
@@ -290,19 +339,27 @@ function pushAborted(
 	stream: AssistantMessageEventStream,
 	partial: AssistantMessage,
 	signal: AbortSignal | undefined,
+	seal?: (message: AssistantMessage) => void,
 ): void {
 	if (stream.done) return;
 	partial.stopReason = "aborted";
 	partial.errorMessage = abortErrorMessage(signal);
+	seal?.(partial);
 	stream.push({ type: "error", reason: "aborted", error: clonePartial(partial) });
 	stream.end();
 }
 
-function pushStreamError(stream: AssistantMessageEventStream, partial: AssistantMessage, err: unknown): void {
+function pushStreamError(
+	stream: AssistantMessageEventStream,
+	partial: AssistantMessage,
+	err: unknown,
+	seal?: (message: AssistantMessage) => void,
+): void {
 	if (stream.done) return;
 	const msg = err instanceof Error ? err.message : String(err);
 	partial.stopReason = "error";
 	partial.errorMessage = `Kiro: ${msg}`;
+	seal?.(partial);
 	stream.push({ type: "error", reason: "error", error: clonePartial(partial) });
 	stream.end();
 }
@@ -344,6 +401,23 @@ export function streamKiro(
 		// One partial for the whole request so an abort mid-summary keeps tokens
 		// already streamed. Compaction awaits `result()` and checks the signal.
 		const partial = makePartial(model);
+		// Clock for `omp stats`: duration is the whole call, ttft is until the
+		// first text, thinking, or tool-call byte.
+		const startedAt = performance.now();
+		let firstTokenAt: number | undefined;
+		let requestBody: KiroGenerateRequest | undefined;
+		let contextPercentage: number | undefined;
+		let explicitInput: number | undefined;
+		let explicitOutput: number | undefined;
+		const noteFirstToken = (): void => {
+			if (firstTokenAt === undefined) firstTokenAt = performance.now();
+		};
+		const seal = (message: AssistantMessage): void => {
+			message.duration = performance.now() - startedAt;
+			if (firstTokenAt !== undefined) message.ttft = firstTokenAt - startedAt;
+			if (!requestBody) return;
+			message.usage = estimateUsage(message, model, requestBody, contextPercentage, explicitInput, explicitOutput);
+		};
 		let responseBody: ReadableStream<Uint8Array> | null = null;
 		const onAbort = (): void => {
 			// Observe the body rejection even when it is not the promise `read()`
@@ -356,9 +430,14 @@ export function streamKiro(
 
 		try {
 			if (signal?.aborted) {
-				pushAborted(stream, partial, signal);
+				pushAborted(stream, partial, signal, seal);
 				return;
 			}
+
+			const { idleTimeoutMs, firstEventTimeoutMs } = resolveStreamWatchdogs(options);
+			const http = options.fetch ?? fetch;
+			const preResponseMs =
+				typeof firstEventTimeoutMs === "number" && firstEventTimeoutMs > 0 ? firstEventTimeoutMs : undefined;
 
 			let accessToken: string;
 			let apiRegion: string;
@@ -369,13 +448,14 @@ export function streamKiro(
 				({ accessToken, apiRegion, profileArn, authMethod } = await resolveCredentials());
 			} catch (err) {
 				if (signal?.aborted || isAbortError(err)) {
-					pushAborted(stream, partial, signal);
+					pushAborted(stream, partial, signal, seal);
 					return;
 				}
 				const msg = err instanceof Error ? err.message : String(err);
 				partial.content = [{ type: "text", text: `Kiro: credential error: ${msg}` }];
 				partial.errorMessage = `Kiro: credential error: ${msg}`;
 				partial.stopReason = "error";
+				seal(partial);
 				stream.push({ type: "error", reason: "error", error: clonePartial(partial) });
 				stream.end();
 				return;
@@ -386,25 +466,40 @@ export function streamKiro(
 			const isDesktop = authMethod === "desktop";
 			const endpoint = isDesktop ? endpointForApiRegion(apiRegion) : qEndpointForApiRegion(apiRegion);
 			if (!isDesktop) {
-				profileArn = await resolveQProfileArn(accessToken, apiRegion, fetch, signal);
+				const profileWatch = armPreResponseTimeout(signal, preResponseMs);
+				try {
+					profileArn = await resolveQProfileArn(accessToken, apiRegion, http, profileWatch.signal);
+				} catch (err) {
+					if (signal?.aborted) {
+						pushAborted(stream, partial, signal, seal);
+						return;
+					}
+					if (profileWatch.signal?.aborted) {
+						pushWatchdog(stream, partial, FIRST_EVENT_TIMEOUT_ERROR, seal);
+						return;
+					}
+					throw err;
+				} finally {
+					profileWatch.clear();
+				}
 			}
 			if (signal?.aborted) {
-				pushAborted(stream, partial, signal);
+				pushAborted(stream, partial, signal, seal);
 				return;
 			}
 
-			let requestBody: KiroGenerateRequest;
 			try {
 				requestBody = buildKiroRequest(model, context, options, profileArn);
 			} catch (err) {
 				if (signal?.aborted || isAbortError(err)) {
-					pushAborted(stream, partial, signal);
+					pushAborted(stream, partial, signal, seal);
 					return;
 				}
 				const msg = err instanceof Error ? err.message : String(err);
 				partial.content = [{ type: "text", text: `Kiro: request build error: ${msg}` }];
 				partial.errorMessage = `Kiro: request build error: ${msg}`;
 				partial.stopReason = "error";
+				seal(partial);
 				stream.push({ type: "error", reason: "error", error: clonePartial(partial) });
 				stream.end();
 				return;
@@ -413,10 +508,23 @@ export function streamKiro(
 			const modelId = requestBody.conversationState.currentMessage.userInputMessage.modelId;
 			logger.debug("kiro-provider: request", { endpoint, modelId, authMethod, hasProfileArn: !!profileArn });
 
+			let wireBody: unknown = requestBody;
+			try {
+				const replaced = await options.onPayload?.(wireBody, model, signal);
+				if (replaced !== undefined) wireBody = replaced;
+			} catch (err) {
+				if (signal?.aborted || isAbortError(err)) {
+					pushAborted(stream, partial, signal, seal);
+					return;
+				}
+				throw err;
+			}
+
 			let res: Response;
 			const { userAgent, amzUserAgent } = kiroIdeUserAgent(await resolveKiroClientVersion());
+			const responseWatch = armPreResponseTimeout(signal, preResponseMs);
 			try {
-				res = await fetch(endpoint, {
+				res = await http(endpoint, {
 					method: "POST",
 					headers: {
 						"Content-Type": "application/x-amz-json-1.0",
@@ -429,13 +537,22 @@ export function streamKiro(
 						"amz-sdk-request": "attempt=1; max=1",
 						"x-amz-user-agent": amzUserAgent,
 						"user-agent": userAgent,
+						...options.headers,
 					},
-					body: JSON.stringify(requestBody),
-					signal: options?.signal,
+					body: JSON.stringify(wireBody),
+					signal: responseWatch.signal,
 				});
 			} catch (err) {
-				if (signal?.aborted || isAbortError(err)) {
-					pushAborted(stream, partial, signal);
+				if (signal?.aborted) {
+					pushAborted(stream, partial, signal, seal);
+					return;
+				}
+				if (responseWatch.signal?.aborted) {
+					pushWatchdog(stream, partial, FIRST_EVENT_TIMEOUT_ERROR, seal);
+					return;
+				}
+				if (isAbortError(err)) {
+					pushAborted(stream, partial, signal, seal);
 					return;
 				}
 				const msg = err instanceof Error ? err.message : String(err);
@@ -443,21 +560,35 @@ export function streamKiro(
 				partial.content = [{ type: "text", text: `Kiro: network error: ${msg}` }];
 				partial.errorMessage = `Kiro: network error: ${msg}`;
 				partial.stopReason = "error";
+				seal(partial);
 				stream.push({ type: "error", reason: "error", error: clonePartial(partial) });
 				stream.end();
 				return;
+			} finally {
+				responseWatch.clear();
 			}
 
 			responseBody = res.body;
+			try {
+				await options.onResponse?.(
+					{ status: res.status, headers: Object.fromEntries(res.headers.entries()) },
+					model,
+					signal,
+				);
+			} catch (err) {
+				logger.warn("kiro-provider: onResponse failed", {
+					err: err instanceof Error ? err.message : String(err),
+				});
+			}
 			if (signal?.aborted) {
-				pushAborted(stream, partial, signal);
+				pushAborted(stream, partial, signal, seal);
 				return;
 			}
 
 			if (!res.ok) {
 				const text = await res.text().catch(() => "");
 				if (signal?.aborted) {
-					pushAborted(stream, partial, signal);
+					pushAborted(stream, partial, signal, seal);
 					return;
 				}
 				logger.error("kiro-provider: API error", { endpoint, status: res.status, body: text.slice(0, 300) });
@@ -469,6 +600,7 @@ export function streamKiro(
 				partial.content = [{ type: "text", text: message }];
 				partial.errorMessage = message;
 				partial.stopReason = "error";
+				seal(partial);
 				stream.push({ type: "error", reason: "error", error: clonePartial(partial) });
 				stream.end();
 				return;
@@ -478,6 +610,7 @@ export function streamKiro(
 				partial.content = [{ type: "text", text: "Kiro: empty response body" }];
 				partial.errorMessage = "Kiro: empty response body";
 				partial.stopReason = "error";
+				seal(partial);
 				stream.push({ type: "error", reason: "error", error: clonePartial(partial) });
 				stream.end();
 				return;
@@ -489,12 +622,6 @@ export function streamKiro(
 			let thinkingIndex: number | undefined;
 			let pendingToolCall: { id: string; name: string; inputStr: string; index: number } | undefined;
 			let emittedToolCalls = 0;
-			let contextPercentage: number | undefined;
-			let explicitInput: number | undefined;
-			let explicitOutput: number | undefined;
-			const applyUsage = (): void => {
-				partial.usage = estimateUsage(partial, model, requestBody, contextPercentage, explicitInput, explicitOutput);
-			};
 
 			// Kiro streams one tool call as several toolUseEvent frames:
 			// `{name, toolUseId, input?}`, then `{input: "<chunk>"}`…, then `{stop: true}`.
@@ -518,7 +645,13 @@ export function streamKiro(
 				pendingToolCall = undefined;
 			};
 
-			for await (const frame of parseEventStream(res.body)) {
+			for await (const frame of iterateWithIdleTimeout(parseEventStream(res.body), {
+				idleTimeoutMs,
+				firstItemTimeoutMs: firstEventTimeoutMs,
+				errorMessage: IDLE_TIMEOUT_ERROR,
+				firstItemErrorMessage: FIRST_EVENT_TIMEOUT_ERROR,
+				abortSignal: signal,
+			})) {
 				const { eventType, messageType, payload } = frame;
 
 				if (messageType === "exception" || messageType === "error") {
@@ -534,6 +667,7 @@ export function streamKiro(
 					logger.error("kiro-provider: stream exception", { eventType, detail: detail.slice(0, 300) });
 					partial.stopReason = "error";
 					partial.errorMessage = message;
+					seal(partial);
 					stream.push({ type: "error", reason: "error", error: clonePartial(partial) });
 					return;
 				}
@@ -562,6 +696,7 @@ export function streamKiro(
 						const segments = splitThinkingTags(raw);
 
 						for (const seg of segments) {
+							if (seg.content) noteFirstToken();
 							if (seg.kind === "thinking") {
 								if (thinkingIndex === undefined) {
 									thinkingIndex = partial.content.length;
@@ -610,6 +745,7 @@ export function streamKiro(
 					case "thinkingEvent": {
 						const thinkingDelta = String(data["content"] ?? "");
 						if (!thinkingDelta) break;
+						noteFirstToken();
 
 						if (thinkingIndex === undefined) {
 							thinkingIndex = partial.content.length;
@@ -633,6 +769,7 @@ export function streamKiro(
 					}
 
 					case "toolUseEvent": {
+						noteFirstToken();
 						if (textIndex !== undefined) {
 							const textBlock = partial.content[textIndex] as TextContent;
 							stream.push({
@@ -732,7 +869,7 @@ export function streamKiro(
 						}
 
 						partial.stopReason = stopReason;
-						applyUsage();
+						seal(partial);
 
 						stream.push({
 							type: "done",
@@ -758,7 +895,7 @@ export function streamKiro(
 			// (steer, Esc, or compaction cancelling a summary). That must not commit
 			// a successful stop — `completeSimple` would then treat the summary as done.
 			if (signal?.aborted) {
-				pushAborted(stream, partial, signal);
+				pushAborted(stream, partial, signal, seal);
 				return;
 			}
 
@@ -784,7 +921,7 @@ export function streamKiro(
 			}
 			const finalReason = emittedToolCalls > 0 ? "toolUse" : "stop";
 			partial.stopReason = finalReason;
-			applyUsage();
+			seal(partial);
 			stream.push({ type: "done", reason: finalReason, message: clonePartial(partial) });
 			stream.end();
 		} catch (err) {
@@ -793,8 +930,9 @@ export function streamKiro(
 			// compaction, whose stacks only show the abort caller.
 			if (!stream.done) {
 				try {
-					if (signal?.aborted || isAbortError(err)) pushAborted(stream, partial, signal);
-					else pushStreamError(stream, partial, err);
+					if (signal?.aborted || isAbortError(err)) pushAborted(stream, partial, signal, seal);
+					else if (err instanceof StreamTimeoutError) pushWatchdog(stream, partial, err.message, seal);
+					else pushStreamError(stream, partial, err, seal);
 				} catch (pushErr) {
 					logger.error("kiro-provider: failed to settle stream", { err: pushErr });
 				}

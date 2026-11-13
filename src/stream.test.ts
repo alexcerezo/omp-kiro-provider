@@ -151,6 +151,11 @@ test("streams a normal response to done", async () => {
 	expect(events.map(event => event.type)).toEqual(["start", "text_start", "text_delta", "text_end", "done"]);
 	expect(message.stopReason).toBe("stop");
 	expect(message.content).toEqual([{ type: "text", text: "Hello" }]);
+	expect(message.duration).toBeGreaterThan(0);
+	expect(message.ttft).toBeGreaterThan(0);
+	expect(message.ttft).toBeLessThanOrEqual(message.duration ?? 0);
+	expect(message.usage.output).toBeGreaterThan(0);
+	expect(message.usage.cost.total).toBeGreaterThan(0);
 	expect(unhandled).toEqual([]);
 });
 
@@ -169,6 +174,8 @@ test("abort before the response arrives settles as aborted", async () => {
 	const { events, message } = await drain(stream);
 	expect(message.stopReason).toBe("aborted");
 	expect(message.errorMessage).toBe("Request was aborted");
+	expect(message.duration).toBeGreaterThan(0);
+	expect(message.ttft).toBeUndefined();
 	expect(events.at(-1)).toMatchObject({ type: "error", reason: "aborted" });
 	expect(events.some(event => event.type === "done")).toBe(false);
 	expect(unhandled).toEqual([]);
@@ -285,6 +292,87 @@ test("abort during Q profile lookup settles before the summary request", async (
 	expect(message.stopReason).toBe("aborted");
 	expect(message.errorMessage).toBe("Request was aborted");
 	expect(calls).toBe(1);
+	expect(unhandled).toEqual([]);
+});
+
+test("honors fetch, headers, and payload hooks", async () => {
+	trackUnhandled();
+	globalThis.fetch = (() => {
+		throw new Error("global fetch should not run");
+	}) as typeof fetch;
+	restoreFetch = () => {
+		globalThis.fetch = realFetch;
+	};
+
+	let sawHeader = false;
+	let sawMarker = false;
+	let status = 0;
+	const stream = streamKiro(
+		model,
+		context,
+		{
+			headers: { "x-test-hook": "1" },
+			onPayload: body => ({ ...(body as Record<string, unknown>), marker: true }),
+			onResponse: response => {
+				status = response.status;
+			},
+			fetch: async (_input, init) => {
+				sawHeader = new Headers(init?.headers).get("x-test-hook") === "1";
+				sawMarker = JSON.parse(String(init?.body)).marker === true;
+				return new Response(helloFrames);
+			},
+		} as SimpleStreamOptions,
+		credentials("desktop"),
+	);
+
+	const { message } = await drain(stream);
+	expect(message.stopReason).toBe("stop");
+	expect(sawHeader).toBe(true);
+	expect(sawMarker).toBe(true);
+	expect(status).toBe(200);
+	expect(unhandled).toEqual([]);
+});
+
+test("first-event timeout settles a hung request", async () => {
+	trackUnhandled();
+	proxyFetch(() => new Promise(() => {}));
+	const stream = streamKiro(
+		model,
+		context,
+		{ streamFirstEventTimeoutMs: 40 } as SimpleStreamOptions,
+		credentials("desktop"),
+	);
+
+	const { message } = await drain(stream);
+	expect(message.stopReason).toBe("error");
+	expect(message.errorMessage).toContain("first event");
+	expect(message.duration).toBeGreaterThan(0);
+	expect(unhandled).toEqual([]);
+});
+
+test("idle timeout keeps text already streamed", async () => {
+	trackUnhandled();
+	proxyFetch(
+		() =>
+			new Response(
+				new ReadableStream({
+					start(controller) {
+						controller.enqueue(encodeFrame("assistantResponseEvent", { content: "Hello" }));
+					},
+				}),
+			),
+	);
+	const stream = streamKiro(
+		model,
+		context,
+		{ streamFirstEventTimeoutMs: 2000, streamIdleTimeoutMs: 40 } as SimpleStreamOptions,
+		credentials("desktop"),
+	);
+
+	const { message } = await drain(stream);
+	expect(message.stopReason).toBe("error");
+	expect(message.errorMessage).toContain("stalled");
+	expect(message.content).toEqual([{ type: "text", text: "Hello" }]);
 	expect(unhandled).toEqual([]);
 });
 

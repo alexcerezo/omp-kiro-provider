@@ -197,9 +197,26 @@ function pairToolCalls(messages: Message[]): Message[] {
 
 /** Thinking budget prefix (pi-kiro parity), applied only to reasoning models when reasoning is requested. */
 function thinkingPrefix(model: Model<Api>, options: SimpleStreamOptions): string {
-	const effort = options?.reasoning;
-	if (!effort || !model.reasoning) return "";
-	const budget = effort === "xhigh" ? 50000 : effort === "high" ? 30000 : effort === "medium" ? 20000 : 10000;
+	// Title generation, captions, and other utility calls set these so a
+	// reasoning model does not spend the turn on thinking. `/effort` and
+	// minimizeEffort still select a budget when reasoning stays on.
+	if (options?.disableReasoning || options?.forceReasoningOff) return "";
+	if (!model.reasoning) return "";
+	const effort = options?.minimizeEffort ? "minimal" : options?.reasoning;
+	if (!effort) return "";
+	const custom = options?.thinkingBudgets?.[effort];
+	const budget =
+		typeof custom === "number" && Number.isFinite(custom) && custom > 0
+			? custom
+			: effort === "max"
+				? 80000
+				: effort === "xhigh"
+					? 50000
+					: effort === "high"
+						? 30000
+						: effort === "medium"
+							? 20000
+							: 10000;
 	return `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budget}</max_thinking_length>`;
 }
 
@@ -253,13 +270,11 @@ export function buildKiroRequest(
 	const basePrompt = context.systemPrompt?.filter(Boolean).join("\n") ?? "";
 	const systemPrompt = prefix && basePrompt ? `${prefix}\n${basePrompt}` : prefix || basePrompt;
 
-	// Failed/aborted assistant turns are never replayed; developer messages have no Kiro wire form.
+	// Failed/aborted assistant turns are never replayed. Developer turns have no
+	// Kiro role, so they travel as user text; dropping them hid instructions
+	// from commands that inject a developer message.
 	const messages = pairToolCalls(
-		context.messages.filter(
-			m =>
-				m.role !== "developer" &&
-				!(m.role === "assistant" && (m.stopReason === "error" || m.stopReason === "aborted")),
-		),
+		context.messages.filter(m => !(m.role === "assistant" && (m.stopReason === "error" || m.stopReason === "aborted"))),
 	);
 
 	// Locate the start of the current turn.
@@ -272,7 +287,7 @@ export function buildKiroRequest(
 	let systemPending = systemPrompt.length > 0;
 
 	for (const msg of messages.slice(0, currentStart)) {
-		if (msg.role === "user") {
+		if (msg.role === "user" || msg.role === "developer") {
 			let content = textOf(msg.content);
 			if (systemPending) {
 				content = `${systemPrompt}\n\n${content}`;
@@ -302,7 +317,7 @@ export function buildKiroRequest(
 	let images: KiroImageInput[] = [];
 	const toolResults: KiroToolResult[] = [];
 
-	if (first?.role === "user") {
+	if (first?.role === "user" || first?.role === "developer") {
 		content = textOf(first.content);
 		images = imagesOf(first.content);
 	} else {
