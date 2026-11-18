@@ -29,7 +29,7 @@ import { kiroUsageProvider } from "./usage";
 
 const factory: ExtensionFactory = pi => {
 	pi.registerProvider("kiro", {
-		api: "kiro-api" as Api,
+		api: "kiro-provider-api" as Api,
 		baseUrl: endpointForApiRegion(DEFAULT_API_REGION),
 		usage: kiroUsageProvider,
 		streamSimple: (

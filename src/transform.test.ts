@@ -10,7 +10,7 @@ import { buildKiroRequest } from "./transform";
 
 const reasoningModel = {
 	id: "claude-sonnet-4.5",
-	api: "kiro-api",
+	api: "kiro-provider-api",
 	provider: "kiro",
 	reasoning: true,
 } as Model<Api>;

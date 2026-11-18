@@ -18,7 +18,7 @@ const realFetch = globalThis.fetch.bind(globalThis);
 
 const model = {
 	id: "claude-sonnet-4.5",
-	api: "kiro-api",
+	api: "kiro-provider-api",
 	provider: "kiro",
 	reasoning: false,
 } as Model<Api>;
