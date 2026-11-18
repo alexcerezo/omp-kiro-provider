@@ -93,7 +93,7 @@ omp plugin update omp-kiro-provider
 
 - **Zero production dependencies.** Host APIs come from omp peer packages.
 - **No install / prepare scripts.** Nothing runs on `npm install`.
-- Published with [npm provenance](https://docs.npmjs.com/generating-provenance-statements) from GitHub Actions (OIDC). The tarball contains runtime `src/*.ts` only — tests and the lockfile stay in git.
+- Published with [npm provenance](https://docs.npmjs.com/generating-provenance-statements) from GitHub Actions (OIDC). Actions are SHA-pinned; checkout does not persist `GITHUB_TOKEN`. The tarball contains runtime `src/*.ts` only — tests and the lockfile stay in git.
 - Network, filesystem, and env access are listed in [SECURITY.md](SECURITY.md). Short version: the plugin talks only to Kiro/AWS endpoints after you log in, reads existing Kiro IDE / kiro-cli credential files, and writes `~/.config/kiro-provider/auth-meta.json` (region/profile, not tokens).
 
 Report vulnerabilities privately: [GitHub Security Advisories](https://github.com/alexcerezo/omp-kiro-provider/security/advisories/new).
