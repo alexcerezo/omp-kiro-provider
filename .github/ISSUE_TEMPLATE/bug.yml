@@ -1,0 +1,38 @@
+name: Bug report
+description: Something in the Kiro provider is broken
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      placeholder: Error text, unexpected model list, failed login, …
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Plugin version
+      placeholder: "2.0.11"
+    validations:
+      required: true
+  - type: input
+    id: omp
+    attributes:
+      label: omp version
+  - type: dropdown
+    id: auth
+    attributes:
+      label: Login method
+      options:
+        - Kiro IDE session reuse
+        - kiro-cli session reuse
+        - IAM Identity Center
+        - Builder ID
+        - GitHub
+        - Google
+        - Not sure
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce

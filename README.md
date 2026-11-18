@@ -2,6 +2,8 @@
 
 [![npm version](https://img.shields.io/npm/v/omp-kiro-provider.svg)](https://www.npmjs.com/package/omp-kiro-provider)
 [![npm downloads](https://img.shields.io/npm/dm/omp-kiro-provider.svg)](https://www.npmjs.com/package/omp-kiro-provider)
+[![CI](https://github.com/alexcerezo/omp-kiro-provider/actions/workflows/ci.yml/badge.svg)](https://github.com/alexcerezo/omp-kiro-provider/actions/workflows/ci.yml)
+[![Socket](https://socket.dev/api/badge/npm/package/omp-kiro-provider)](https://socket.dev/npm/package/omp-kiro-provider)
 [![license](https://img.shields.io/npm/l/omp-kiro-provider.svg)](LICENSE)
 
 Unofficial [Kiro](https://kiro.dev) provider plugin for [oh-my-pi (omp)](https://github.com/can1357/oh-my-pi). Use your Kiro / Amazon Q subscription from omp: OAuth login, live model discovery, streaming with thinking and tools, and usage in `omp stats`.
@@ -85,15 +87,24 @@ omp plugin update omp-kiro-provider
 | --- | --- |
 | `KIRO_IDE_VERSION` | Force the Kiro IDE version in the User-Agent |
 | `KIRO_CLI_VERSION` | Same as `KIRO_IDE_VERSION` (legacy alias) |
+| `LOCALAPPDATA` | Windows only: locate the kiro-cli credential DB |
+
+## Supply chain
+
+- **Zero production dependencies.** Host APIs come from omp peer packages.
+- **No install / prepare scripts.** Nothing runs on `npm install`.
+- Published with [npm provenance](https://docs.npmjs.com/generating-provenance-statements) from GitHub Actions (OIDC). The tarball contains runtime `src/*.ts` only — tests and the lockfile stay in git.
+- Network, filesystem, and env access are listed in [SECURITY.md](SECURITY.md). Short version: the plugin talks only to Kiro/AWS endpoints after you log in, reads existing Kiro IDE / kiro-cli credential files, and writes `~/.config/kiro-provider/auth-meta.json` (region/profile, not tokens).
+
+Report vulnerabilities privately: [GitHub Security Advisories](https://github.com/alexcerezo/omp-kiro-provider/security/advisories/new).
 
 ## Development
 
 ```bash
 bun test
-bun run check:types
 ```
 
-Publishing to npm is automated: a GitHub Release whose tag matches `package.json` (for example `v2.0.10`) runs [`.github/workflows/publish.yml`](.github/workflows/publish.yml) with npm trusted publishing (OIDC). No npm token is stored in the repo.
+Publishing to npm is automated: a GitHub Release whose tag matches `package.json` (for example `v2.0.11`) runs [`.github/workflows/publish.yml`](.github/workflows/publish.yml) after CI tests. It uses npm trusted publishing (OIDC), so no token is stored in the repo.
 
 ## License
 
