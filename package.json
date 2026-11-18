@@ -1,7 +1,8 @@
 {
   "name": "omp-kiro-provider",
-  "version": "2.0.9",
-  "description": "Kiro AI provider plugin for omp — OAuth login, dynamic model discovery, and streaming inference",
+  "version": "2.0.10",
+  "description": "Kiro / Amazon Q provider plugin for oh-my-pi (omp): IAM Identity Center, Builder ID, GitHub and Google OAuth, live model discovery, and streaming inference",
+  "author": "Alex Cerezo",
   "main": "./src/index.ts",
   "types": "./src/index.ts",
   "exports": {
@@ -26,15 +27,23 @@
   },
   "keywords": [
     "omp",
+    "omp-plugin",
+    "omp-extension",
+    "oh-my-pi",
     "kiro",
-    "ai",
+    "kiro-cli",
+    "aws",
+    "amazon-q",
+    "codewhisperer",
+    "iam-identity-center",
+    "oauth",
     "provider",
-    "oh-my-pi"
+    "claude"
   ],
   "license": "MIT",
   "omp": {
     "name": "Kiro",
-    "description": "Kiro AI provider for omp — OAuth login, dynamic model discovery, and streaming inference",
+    "description": "Kiro / Amazon Q provider for omp — OAuth login, live model discovery, and streaming inference",
     "extensions": [
       "src/index.ts"
     ]
